@@ -29,21 +29,31 @@ COGNITO_APP_CLIENT_ID = os.getenv("COGNITO_APP_CLIENT_ID", "")
 
 # Cache Cognito Public Keys
 JWKS_URL = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
-jwks = requests.get(JWKS_URL).json() if COGNITO_USER_POOL_ID else {"keys": []}
+jwks_data = None
+
+def get_jwks():
+    global jwks_data
+    if not jwks_data and COGNITO_USER_POOL_ID:
+        try:
+            res = requests.get(JWKS_URL)
+            if res.status_code == 200:
+                jwks_data = res.json()
+        except Exception as e:
+            print(f"Failed to load JWKS keys from Cognito: {e}")
+    return jwks_data or {"keys": []}
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
     """Verifies incoming Bearer JWT against AWS Cognito JWKS keys."""
     token = credentials.credentials
     try:
         header = jwt.get_unverified_header(token)
-        kid = header["kid"]
+        kid = header.get("kid")
         
-        # Locate matching key in JWKS
+        jwks = get_jwks()
         key = next((k for k in jwks["keys"] if k["kid"] == kid), None)
         if not key:
             raise HTTPException(status_code=401, detail="Public key not found in JWKS")
             
-        # Verify Token Signature & Claims
         payload = jwt.decode(
             token,
             key,
@@ -51,7 +61,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
             audience=COGNITO_APP_CLIENT_ID,
             issuer=f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}"
         )
-        return payload  # Contains user 'sub' ID and email
+        return payload
     except JWTError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -66,7 +76,7 @@ def health_check():
 async def stream_agent_execution(
     project_id: str,
     prompt: str,
-    current_user: dict = Depends(get_current_user)  # Protected route
+    current_user: dict = Depends(get_current_user)
 ):
     user_id = current_user.get("sub", "anonymous_user")
     
