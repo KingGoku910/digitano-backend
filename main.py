@@ -1,92 +1,92 @@
-# router.py - CONSOLIDATED AI AGENT ROUTER ENGINE
+import os
 import json
-import boto3
-import google.generativeai as genai
+import requests
+from fastapi import FastAPI, Depends, HTTPException, status, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from sse_starlette.sse import EventSourceResponse
+from jose import jwt, JWTError
 
-# Initialize AWS Bedrock Client
-bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+from router import AGENT_PROMPTS, call_agent
+from dynamo_service import save_project_prd
 
-# ==========================================
-# 1. AGENT CONFIGURATION & SYSTEM PROMPTS
-# ==========================================
-AGENT_PROMPTS = {
-    # AGENT 1: Product Owner
-    "product_owner": """
-    Role: Product Owner.
-    Task: Take raw user prompt and define high-level scope, target audience, core features, and primary success metrics.
-    Output: Must output JSON matching ProductOwnerSchema.
-    """,
+app = FastAPI(title="Digitano Builder API")
 
-    # AGENT 2: Software Analyst
-    "software_analyst": """
-    Role: Software Analyst.
-    Task: Review Product Owner output. Draft prioritized User Stories (As a... I want... So that...) and Edge Case Failure Modes.
-    Output: Must output JSON matching AnalystSchema.
-    """,
+# Enable CORS for Next.js Bolt Frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    # AGENT 3: UI Lead
-    "ui_lead": """
-    Role: UI/UX Architect.
-    Task: Define component hierarchies, color tokens, layout grids, and ShadCN/Tailwind specifications based on user stories.
-    Output: Must output JSON matching UISchema.
-    """,
+# Cognito JWT Setup
+security = HTTPBearer()
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+COGNITO_USER_POOL_ID = os.getenv("COGNITO_USER_POOL_ID", "")
+COGNITO_APP_CLIENT_ID = os.getenv("COGNITO_APP_CLIENT_ID", "")
 
-    # AGENT 4: Backend Lead
-    "backend_lead": """
-    Role: Backend Architect.
-    Task: Design FastAPI endpoint specifications, HTTP methods, payload schemas, and single-table DynamoDB access patterns (PK/SK).
-    Output: Must output JSON matching BackendSchema.
-    """,
+# Cache Cognito Public Keys
+JWKS_URL = f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}/.well-known/jwks.json"
+jwks = requests.get(JWKS_URL).json() if COGNITO_USER_POOL_ID else {"keys": []}
 
-    # AGENT 5: Full Stack Lead
-    "fullstack_lead": """
-    Role: Full Stack Integrator.
-    Task: Define state management patterns, client-side data fetching hooks (SWR/React Query), and API error handling contracts.
-    Output: Must output JSON matching FullStackSchema.
-    """,
-
-    # AGENT 6: Infrastructure Architect
-    "infra_architect": """
-    Role: Cloud Infrastructure Engineer.
-    Task: Specify serverless AWS deployment setup (App Runner, Amplify, DynamoDB, IAM Roles) for $0-tier execution.
-    Output: Must output JSON matching InfraSchema.
-    """,
-
-    # AGENT 7: Scrum Master
-    "scrum_master": """
-    Role: Scrum Master & Prompt Engineer.
-    Task: Consolidate outputs from all prior 6 agents. Audit for inconsistencies, format final PRD Markdown, and generate structured Vibe-Coder copy-paste prompts (Prompts 1.1, 1.2, 1.3).
-    Output: Must output JSON matching FinalScrumOutputSchema.
-    """
-}
-
-# ==========================================
-# 2. DUAL-MODEL EXECUTION & FAILOVER
-# ==========================================
-async def call_agent(agent_name: str, system_prompt: str, context_data: str):
-    full_prompt = f"{system_prompt}\n\nInput Context:\n{context_data}"
-    
-    # Primary LLM Call: AWS Bedrock (Claude 3.5 Sonnet)
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security)):
+    """Verifies incoming Bearer JWT against AWS Cognito JWKS keys."""
+    token = credentials.credentials
     try:
-        payload = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 2000,
-            "messages": [{"role": "user", "content": full_prompt}]
-        }
-        response = bedrock_client.invoke_model(
-            modelId="anthropic.claude-3-5-sonnet-20240620-v1:0",
-            body=json.dumps(payload)
-        )
-        result = json.loads(response["body"].read())["content"][0]["text"]
-        return {"agent": agent_name, "status": "success", "provider": "Bedrock", "data": result}
-
-    except Exception as e:
-        print(f"AWS Bedrock throttled for {agent_name}. Failing over to Gemini Flash... Error: {e}")
+        header = jwt.get_unverified_header(token)
+        kid = header["kid"]
         
-        # Automated Fallback LLM Call: Google Gemini Flash
-        try:
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            gemini_response = model.generate_content(full_prompt)
-            return {"agent": agent_name, "status": "success", "provider": "Gemini-Fallback", "data": gemini_response.text}
-        except Exception as gemini_err:
-            return {"agent": agent_name, "status": "failed", "error": str(gemini_err)}
+        # Locate matching key in JWKS
+        key = next((k for k in jwks["keys"] if k["kid"] == kid), None)
+        if not key:
+            raise HTTPException(status_code=401, detail="Public key not found in JWKS")
+            
+        # Verify Token Signature & Claims
+        payload = jwt.decode(
+            token,
+            key,
+            algorithms=["RS256"],
+            audience=COGNITO_APP_CLIENT_ID,
+            issuer=f"https://cognito-idp.{AWS_REGION}.amazonaws.com/{COGNITO_USER_POOL_ID}"
+        )
+        return payload  # Contains user 'sub' ID and email
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Invalid or expired JWT token: {str(e)}"
+        )
+
+@app.get("/")
+def health_check():
+    return {"status": "Digitano Backend Operating Normally"}
+
+@app.get("/api/stream-progress/{project_id}")
+async def stream_agent_execution(
+    project_id: str,
+    prompt: str,
+    current_user: dict = Depends(get_current_user)  # Protected route
+):
+    user_id = current_user.get("sub", "anonymous_user")
+    
+    async def event_generator():
+        context = {"raw_prompt": prompt}
+        for agent_name, system_prompt in AGENT_PROMPTS.items():
+            yield {
+                "event": "agent_update",
+                "data": json.dumps({"agent": agent_name, "status": "Thinking..."})
+            }
+            
+            res = await call_agent(agent_name, system_prompt, json.dumps(context))
+            context[agent_name] = res["data"]
+            
+            yield {
+                "event": "agent_update",
+                "data": json.dumps({"agent": agent_name, "status": "Complete", "output": res["data"]})
+            }
+            
+        # Persist final PRD associated with authenticated user ID
+        save_project_prd(user_id, project_id, prompt, context)
+
+    return EventSourceResponse(event_generator())
