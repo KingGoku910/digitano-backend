@@ -1,4 +1,3 @@
-# dynamo_service.py - SINGLE-TABLE DYNAMODB PERSISTENCE SERVICE
 import os
 import boto3
 from botocore.exceptions import ClientError
@@ -7,6 +6,7 @@ from datetime import datetime
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+TABLE_NAME = os.getenv("DYNAMODB_TABLE_NAME", "DigitanoProjects")
 
 dynamodb = boto3.resource(
     "dynamodb",
@@ -15,7 +15,6 @@ dynamodb = boto3.resource(
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY
 )
 
-TABLE_NAME = "DigitanoProjects"
 table = dynamodb.Table(TABLE_NAME)
 
 def save_project_prd(user_id: str, project_id: str, prompt: str, generated_prd: dict) -> dict:
@@ -60,4 +59,3 @@ def get_project_prd(user_id: str, project_id: str) -> dict:
     except ClientError as e:
         print(f"DynamoDB GetItem Error: {e.response['Error']['Message']}")
         return {"status": "error", "message": e.response['Error']['Message']}
-
