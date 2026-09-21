@@ -5,4 +5,5 @@ google-generativeai
 pydantic
 python-dotenv
 sse-starlette
-
+python-jose[cryptography]
+requests
